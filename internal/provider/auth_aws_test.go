@@ -4,13 +4,17 @@
 package provider
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-secure-stdlib/awsutil/v2"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -649,4 +653,165 @@ func TestAuthLoginAWS_Login(t *testing.T) {
 			testAuthLogin(t, tt)
 		})
 	}
+}
+
+// staticAWSConfig returns an aws.Config with static credentials for unit testing.
+func staticAWSConfig(region string) *aws.Config {
+	return &aws.Config{
+		Region: region,
+		Credentials: aws.NewCredentialsCache(aws.CredentialsProviderFunc(
+			func(_ context.Context) (aws.Credentials, error) {
+				return aws.Credentials{
+					AccessKeyID:     "AKIAIOSFODNN7EXAMPLE",
+					SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+				}, nil
+			},
+		)),
+	}
+}
+
+// TestGenerateLoginData_SigV4POSTProducesAuthorizationHeader verifies that the
+// generated login data uses a POST method with a SigV4 Authorization header
+// containing the correct signing region and STS endpoint for each configuration.
+func TestGenerateLoginData_SigV4POSTProducesAuthorizationHeader(t *testing.T) {
+	tests := []struct {
+		name            string
+		region          string
+		stsEndpoint     string
+		wantURLPrefix   string
+		wantRegion      string
+	}{
+		{
+			name:          "explicit-region",
+			region:        "us-west-2",
+			stsEndpoint:   "",
+			wantURLPrefix: "https://sts.us-west-2.amazonaws.com",
+			wantRegion:    "us-west-2",
+		},
+		{
+			name:          "empty-region-falls-back-to-us-east-1",
+			region:        "",
+			stsEndpoint:   "",
+			wantURLPrefix: "https://sts.amazonaws.com",
+			wantRegion:    "us-east-1",
+		},
+		{
+			name:          "custom-sts-endpoint-with-explicit-region",
+			region:        "eu-west-1",
+			stsEndpoint:   "https://sts.custom.internal",
+			wantURLPrefix: "https://sts.custom.internal",
+			wantRegion:    "eu-west-1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			cfg := staticAWSConfig(tt.region)
+
+			loginData, err := generateLoginData(ctx, cfg, "", tt.stsEndpoint, hclog.NewNullLogger())
+			if err != nil {
+				t.Fatalf("generateLoginData() error = %v", err)
+			}
+
+			if got := loginData[consts.FieldIAMHttpRequestMethod]; got != http.MethodPost {
+				t.Errorf("method = %v, want POST", got)
+			}
+
+			rawURL, err := base64.StdEncoding.DecodeString(loginData[consts.FieldIAMRequestURL].(string))
+			if err != nil {
+				t.Fatalf("base64-decode URL: %v", err)
+			}
+			if !strings.HasPrefix(string(rawURL), tt.wantURLPrefix) {
+				t.Errorf("URL = %q, want prefix %q", string(rawURL), tt.wantURLPrefix)
+			}
+
+			rawHeaders, err := base64.StdEncoding.DecodeString(loginData[consts.FieldIAMRequestHeaders].(string))
+			if err != nil {
+				t.Fatalf("base64-decode headers: %v", err)
+			}
+			var headers http.Header
+			if err := json.Unmarshal(rawHeaders, &headers); err != nil {
+				t.Fatalf("unmarshal headers: %v", err)
+			}
+
+			authHeader := headers.Get("Authorization")
+			if authHeader == "" {
+				t.Fatal("Authorization header is absent")
+			}
+			if !strings.HasPrefix(authHeader, "AWS4-HMAC-SHA256 ") {
+				t.Errorf("Authorization header scheme = %q, want AWS4-HMAC-SHA256", authHeader)
+			}
+			// verify the credential scope contains the expected region
+			if !strings.Contains(authHeader, "/"+tt.wantRegion+"/sts/aws4_request") {
+				t.Errorf("Authorization header %q does not contain region scope %q",
+					authHeader, "/"+tt.wantRegion+"/sts/aws4_request")
+			}
+		})
+	}
+}
+
+// TestGenerateLoginData_BodyAndServerIDHeader verifies the request body content
+// and X-Vault-AWS-IAM-Server-ID header presence.
+func TestGenerateLoginData_BodyAndServerIDHeader(t *testing.T) {
+	const (
+		expectedBody     = "Action=GetCallerIdentity&Version=2011-06-15"
+		serverIDHeader   = "X-Vault-AWS-IAM-Server-ID"
+		testHeaderValue  = "vault.example.internal"
+	)
+
+	ctx := context.Background()
+	cfg := staticAWSConfig("us-east-1")
+
+	decodeHeaders := func(t *testing.T, loginData map[string]interface{}) http.Header {
+		t.Helper()
+		raw, err := base64.StdEncoding.DecodeString(loginData[consts.FieldIAMRequestHeaders].(string))
+		if err != nil {
+			t.Fatalf("base64-decode headers: %v", err)
+		}
+		var h http.Header
+		if err := json.Unmarshal(raw, &h); err != nil {
+			t.Fatalf("unmarshal headers: %v", err)
+		}
+		return h
+	}
+
+	t.Run("body-is-sts-action", func(t *testing.T) {
+		loginData, err := generateLoginData(ctx, cfg, "", "", hclog.NewNullLogger())
+		if err != nil {
+			t.Fatalf("generateLoginData() error = %v", err)
+		}
+
+		raw, err := base64.StdEncoding.DecodeString(loginData[consts.FieldIAMRequestBody].(string))
+		if err != nil {
+			t.Fatalf("base64-decode body: %v", err)
+		}
+		if string(raw) != expectedBody {
+			t.Errorf("body = %q, want %q", string(raw), expectedBody)
+		}
+	})
+
+	t.Run("server-id-header-present-when-set", func(t *testing.T) {
+		loginData, err := generateLoginData(ctx, cfg, testHeaderValue, "", hclog.NewNullLogger())
+		if err != nil {
+			t.Fatalf("generateLoginData() error = %v", err)
+		}
+
+		headers := decodeHeaders(t, loginData)
+		if got := headers.Get(serverIDHeader); got != testHeaderValue {
+			t.Errorf("%s = %q, want %q", serverIDHeader, got, testHeaderValue)
+		}
+	})
+
+	t.Run("server-id-header-absent-when-not-set", func(t *testing.T) {
+		loginData, err := generateLoginData(ctx, cfg, "", "", hclog.NewNullLogger())
+		if err != nil {
+			t.Fatalf("generateLoginData() error = %v", err)
+		}
+
+		headers := decodeHeaders(t, loginData)
+		if got := headers.Get(serverIDHeader); got != "" {
+			t.Errorf("%s should be absent, got %q", serverIDHeader, got)
+		}
+	})
 }
