@@ -1,6 +1,9 @@
 > [!CAUTION]
 > **This file is a working draft and will be removed before the PR is submitted.**
+> 
 > Branch: https://github.com/straubt1/terraform-provider-vault/tree/fix/aws-auth-sts-region-from-client
+> 
+> Compare: https://github.com/hashicorp/terraform-provider-vault/compare/main...straubt1:terraform-provider-vault:fix/aws-auth-sts-region-from-client
 
 ---
 
