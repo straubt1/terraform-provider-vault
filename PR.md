@@ -5,6 +5,9 @@
 > 
 > Compare: https://github.com/hashicorp/terraform-provider-vault/compare/main...straubt1:terraform-provider-vault:fix/aws-auth-sts-region-from-client
 
+Another PR with a different approach: https://github.com/hashicorp/terraform-provider-vault/pull/2786
+
+Current code seems to be more of a revert back to not use presigning, investigating.
 ---
 
 ### Description
